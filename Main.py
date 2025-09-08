@@ -1,303 +1,209 @@
 # Main.py
-# Discord moderation bot with ticket system + automatic slowdown (anti-spam)
-# Requirements: discord.py (v2.x), python-dotenv
-# Fill in your bot token and adjust settings in the .env file.
+# Discord moderation bot with:
+# - Ticket system (open/close)
+# - Automatic slowdown (anti-spam)
+# - Admin slowmode tools
+#
+# Requirements: discord.py, python-dotenv
 
 import os
 import asyncio
-import logging
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from dotenv import load_dotenv
 
-# --- Load configuration ---
-load_dotenv()  # Loads variables from .env into environment
-
+# --------------------
+# Load .env config
+# --------------------
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN or TOKEN == "YOUR_DISCORD_TOKEN_HERE":
-    raise RuntimeError("Please set DISCORD_TOKEN in your .env file.")
-
 PREFIX = os.getenv("BOT_PREFIX", "!")
 MOD_ROLE_NAME = os.getenv("MOD_ROLE_NAME", "Moderator")
 TICKET_CATEGORY_NAME = os.getenv("TICKET_CATEGORY_NAME", "Tickets")
 
-# Anti-spam / slowdown settings (integers, can be changed in .env)
 SLOW_THRESHOLD = int(os.getenv("SLOW_THRESHOLD", "5"))          # messages
-SLOW_WINDOW = int(os.getenv("SLOW_WINDOW", "7"))                # seconds window to count messages
-SLOW_MODE_DURATION = int(os.getenv("SLOW_MODE_DURATION", "10")) # slowmode seconds to set
-SLOW_RESET_SECONDS = int(os.getenv("SLOW_RESET_SECONDS", "60")) # how long slowmode stays set before restoring
+SLOW_WINDOW = int(os.getenv("SLOW_WINDOW", "7"))                # seconds
+SLOW_MODE_DURATION = int(os.getenv("SLOW_MODE_DURATION", "10")) # seconds
+SLOW_RESET_SECONDS = int(os.getenv("SLOW_RESET_SECONDS", "60")) # seconds
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('bot')
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN missing in .env file")
 
-# Intents (we need message content for anti-spam)
+# --------------------
+# Bot setup
+# --------------------
 intents = discord.Intents.default()
 intents.message_content = True
-intents.guilds = True
 intents.members = True
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=commands.DefaultHelpCommand(no_category="Commands"))
-
-# In-memory counters and state
-# user_message_times[guild_id][channel_id][user_id] = deque of timestamps
-user_message_times = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: deque())))
-# channel_slowstate[channel_id] = { "original": <int slowmode>, "reset_task": <asyncio.Task> }
-channel_slowstate = {}
+# Track messages for spam
+message_history = defaultdict(lambda: defaultdict(lambda: defaultdict(deque)))
+# Track auto-slow state
+slow_channels = {}
 
 # --------------------
-# Helper utilities
+# Helpers
 # --------------------
-def is_mod(member: discord.Member):
-    """Return True if member has the mod role or guild permissions manage_messages."""
-    if member.guild_permissions.manage_messages or member.guild_permissions.manage_channels or member.guild_permissions.kick_members:
+def is_mod(member: discord.Member) -> bool:
+    """Check if a member is a moderator."""
+    if member.guild_permissions.manage_messages or member.guild_permissions.kick_members:
         return True
-    for role in member.roles:
-        if role.name == MOD_ROLE_NAME:
-            return True
-    return False
+    return any(role.name == MOD_ROLE_NAME for role in member.roles)
 
-async def ensure_ticket_category(guild: discord.Guild):
-    """Ensure a 'Tickets' category exists and return it."""
-    for cat in guild.categories:
-        if cat.name == TICKET_CATEGORY_NAME:
-            return cat
-    # not found -> create (requires manage_channels)
-    try:
-        cat = await guild.create_category(TICKET_CATEGORY_NAME, reason="Ticket system initialization")
-        logger.info(f"Created ticket category in guild {guild.name}")
-        return cat
-    except discord.Forbidden:
-        logger.warning("Lacking permissions to create ticket category. Tickets might fail.")
-        return None
-
-async def schedule_slowmode_reset(channel: discord.TextChannel, original_slowmode: int, delay_seconds: int):
-    """Wait delay_seconds then restore channel slowmode to original_slowmode."""
-    async def _reset():
+async def ensure_ticket_category(guild: discord.Guild) -> discord.CategoryChannel | None:
+    """Ensure a category for tickets exists."""
+    category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+    if not category:
         try:
-            await asyncio.sleep(delay_seconds)
-            # If channel still exists, restore
-            ch = channel
-            try:
-                await ch.edit(slowmode_delay=original_slowmode, reason="Automatic slowdown reset")
-                logger.info(f"Restored slowmode for #{ch.name} to {original_slowmode}")
-            except Exception as e:
-                logger.warning(f"Could not restore slowmode for channel {channel.id}: {e}")
-        finally:
-            # cleanup tracking entry
-            channel_slowstate.pop(channel.id, None)
+            category = await guild.create_category(TICKET_CATEGORY_NAME, reason="Ticket system")
+        except discord.Forbidden:
+            return None
+    return category
 
-    task = asyncio.create_task(_reset())
-    channel_slowstate[channel.id] = {"original": original_slowmode, "reset_task": task}
+async def reset_slowmode(channel: discord.TextChannel, original: int, delay: int):
+    """Restore original slowmode after delay."""
+    await asyncio.sleep(delay)
+    try:
+        await channel.edit(slowmode_delay=original, reason="Auto slowmode reset")
+    except Exception:
+        pass
+    slow_channels.pop(channel.id, None)
 
 # --------------------
 # Events
 # --------------------
 @bot.event
 async def on_ready():
-    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    logger.info("Bot is ready.")
-    # start any persistent tasks if needed
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot messages
-    if message.author.bot or not message.guild:
+    if not message.guild or message.author.bot:
         return
 
-    guild_id = message.guild.id
-    channel_id = message.channel.id
-    user_id = message.author.id
-
-    # Record message timestamp for anti-spam
-    dq = user_message_times[guild_id][channel_id][user_id]
     now = datetime.utcnow()
-    dq.append(now)
+    history = message_history[message.guild.id][message.channel.id][message.author.id]
+    history.append(now)
 
-    # Remove timestamps older than SLOW_WINDOW
+    # Keep only messages in the last SLOW_WINDOW seconds
     cutoff = now - timedelta(seconds=SLOW_WINDOW)
-    while dq and dq[0] < cutoff:
-        dq.popleft()
+    while history and history[0] < cutoff:
+        history.popleft()
 
-    # Check threshold
-    if len(dq) >= SLOW_THRESHOLD:
-        # If channel already in auto-slow state, do nothing
-        if channel_id not in channel_slowstate:
-            # Try to set slowmode on the channel
-            channel = message.channel
-            try:
-                original = channel.slowmode_delay or 0
-                await channel.edit(slowmode_delay=SLOW_MODE_DURATION, reason="Automatic slowdown due to rapid messaging")
-                logger.info(f"Set slowmode {SLOW_MODE_DURATION}s in #{channel.name} (guild: {message.guild.name}) due to spam.")
-                # schedule restore after SLOW_RESET_SECONDS
-                await schedule_slowmode_reset(channel, original, SLOW_RESET_SECONDS)
+    if len(history) >= SLOW_THRESHOLD and message.channel.id not in slow_channels:
+        original = message.channel.slowmode_delay
+        try:
+            await message.channel.edit(
+                slowmode_delay=SLOW_MODE_DURATION,
+                reason="Auto slowdown due to spam"
+            )
+            msg = await message.channel.send(
+                f"⚠️ Slowmode enabled ({SLOW_MODE_DURATION}s) due to spam. "
+                f"Resets in {SLOW_RESET_SECONDS}s."
+            )
+            await asyncio.sleep(8)
+            await msg.delete()
+        except discord.Forbidden:
+            pass
 
-                # inform the channel briefly (ephemeral-ish) - send a message and delete after a few secs
-                info = await channel.send(f":rotating_light: Slowmode enabled for {SLOW_MODE_DURATION}s due to rapid messages. It will auto-reset in {SLOW_RESET_SECONDS}s.")
-                await asyncio.sleep(8)
-                try:
-                    await info.delete()
-                except Exception:
-                    pass
+        # Schedule reset
+        slow_channels[message.channel.id] = True
+        bot.loop.create_task(reset_slowmode(message.channel, original, SLOW_RESET_SECONDS))
 
-                # clear the records for that channel to avoid repeated triggers
-                user_message_times[guild_id].pop(channel_id, None)
-            except discord.Forbidden:
-                logger.warning("Missing permission to edit channel slowmode. Please give Manage Channels permission.")
-            except Exception as e:
-                logger.exception(f"Failed to apply automatic slowmode: {e}")
-
-    # Allow commands to process
     await bot.process_commands(message)
 
 # --------------------
-# Ticket commands (open/close)
+# Ticket system
 # --------------------
 @bot.group(invoke_without_command=True)
-async def ticket(ctx: commands.Context, *args):
-    """Ticket command group. Use !ticket open <reason> or !ticket close"""
-    await ctx.send_help(ctx.command)
+async def ticket(ctx: commands.Context):
+    """Ticket system commands"""
+    await ctx.send("Use `!ticket open <reason>` or `!ticket close`")
 
-@ticket.command(name="open")
-async def ticket_open(ctx: commands.Context, *, reason: str = "No reason provided"):
-    """Open a private ticket channel in the server."""
-    guild = ctx.guild
-    author = ctx.author
+@ticket.command()
+async def open(ctx: commands.Context, *, reason: str = "No reason provided"):
+    category = await ensure_ticket_category(ctx.guild)
+    if not category:
+        return await ctx.send("❌ Cannot create ticket category. Missing permissions.")
 
-    # Ensure category exists
-    category = await ensure_ticket_category(guild)
-    if category is None:
-        await ctx.send("Ticket category not found and I can't create one (missing permissions). Please ask an admin to create a category named: " + TICKET_CATEGORY_NAME)
-        return
+    name = f"ticket-{ctx.author.name}".lower().replace(" ", "-")
+    if discord.utils.get(category.channels, name=name):
+        name = f"{name}-{ctx.author.discriminator}"
 
-    # Channel name sanitization
-    chan_name = f"ticket-{author.name}".lower().replace(" ", "-")
-    # avoid name collision by appending short id if exists
-    existing = discord.utils.get(category.channels, name=chan_name)
-    if existing:
-        chan_name = f"{chan_name}-{author.discriminator}"
-
-    # Permissions: only author, mods, and bot can see
     overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=False),
-        author: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True)
+        ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        ctx.author: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        ctx.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
     }
 
-    # Allow mod role to view if present
-    mod_role = discord.utils.get(guild.roles, name=MOD_ROLE_NAME)
+    mod_role = discord.utils.get(ctx.guild.roles, name=MOD_ROLE_NAME)
     if mod_role:
-        overwrites[mod_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True, manage_channels=False)
+        overwrites[mod_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
-    # Create channel
+    channel = await ctx.guild.create_text_channel(
+        name=name,
+        category=category,
+        overwrites=overwrites,
+        topic=f"Ticket owner: {ctx.author.id}"
+    )
+
+    embed = discord.Embed(
+        title="🎫 Ticket Opened",
+        description=f"Reason: {reason}",
+        color=discord.Color.blurple(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="User", value=ctx.author.mention)
+    embed.set_footer(text="Staff: use !ticket close to close this ticket.")
+    await channel.send(embed=embed)
+    await ctx.send(f"✅ Ticket created: {channel.mention}")
+
+@ticket.command()
+async def close(ctx: commands.Context):
+    if not ctx.channel.category or ctx.channel.category.name != TICKET_CATEGORY_NAME:
+        return await ctx.send("❌ This command can only be used inside a ticket channel.")
+
+    # Extract ticket owner ID from topic
+    owner_id = None
+    if ctx.channel.topic and ctx.channel.topic.startswith("Ticket owner: "):
+        try:
+            owner_id = int(ctx.channel.topic.replace("Ticket owner: ", ""))
+        except ValueError:
+            pass
+
+    if ctx.author.id != owner_id and not is_mod(ctx.author):
+        return await ctx.send("❌ Only the ticket owner or staff can close this ticket.")
+
+    await ctx.send("⏳ Closing ticket in 5s...")
+    await asyncio.sleep(5)
     try:
-        channel = await guild.create_text_channel(name=chan_name, overwrites=overwrites, category=category, reason=f"Ticket opened by {author}")
+        await ctx.channel.delete(reason=f"Ticket closed by {ctx.author}")
     except discord.Forbidden:
-        await ctx.send("I don't have permission to create channels. Please give me Manage Channels permission.")
-        return
-    except Exception as e:
-        await ctx.send("Failed to create ticket channel: " + str(e))
-        return
-
-    # Send initial message with instructions
-    embed = discord.Embed(title="Ticket Created", color=discord.Color.blurple(), timestamp=datetime.utcnow())
-    embed.add_field(name="User", value=f"{author.mention} ({author})", inline=False)
-    embed.add_field(name="Reason", value=reason, inline=False)
-    embed.set_footer(text="Staff: Use !ticket close to close this ticket.")
-    await channel.send(content=f"{author.mention} Thank you — a staff member will be with you shortly.", embed=embed)
-    await ctx.reply(f"Your ticket has been created: {channel.mention}", mention_author=False)
-
-@ticket.command(name="close")
-async def ticket_close(ctx: commands.Context):
-    """Close the ticket. Can be used by the ticket author or moderators."""
-    channel = ctx.channel
-    guild = ctx.guild
-
-    # Only allow in ticket category channels
-    if not channel.category or channel.category.name != TICKET_CATEGORY_NAME:
-        await ctx.send("This command can only be used inside a ticket channel.")
-        return
-
-    # Check permission: author or mod
-    # If author, allow. If mod (has mod role / manage_messages), allow.
-    # Otherwise deny.
-    # Attempt to find ticket owner by looking for first message embed user field (best-effort)
-    can_close = False
-    if is_mod(ctx.author):
-        can_close = True
-    else:
-        # try to check if invoking user is the ticket owner by checking channel name
-        # channel name expected like ticket-username or ticket-username-1234
-        if ctx.author.name.lower() in channel.name:
-            can_close = True
-
-    if not can_close:
-        await ctx.send("Only the ticket opener or staff can close this ticket.")
-        return
-
-    # Archive/close: delete channel after a short delay so logs can be read, or optionally lock
-    try:
-        await channel.send("This ticket will be closed in 5 seconds...")
-        await asyncio.sleep(5)
-        await channel.delete(reason=f"Ticket closed by {ctx.author}")
-    except discord.Forbidden:
-        await ctx.send("I don't have permission to delete this channel. Ask an admin to remove it.")
-    except Exception as e:
-        await ctx.send("Failed to close ticket: " + str(e))
+        await ctx.send("❌ Missing permissions to delete this channel.")
 
 # --------------------
-# Admin / utility commands
+# Slowmode commands
 # --------------------
-@bot.command(name="slowstatus")
+@bot.command()
 async def slowstatus(ctx: commands.Context):
-    """Check if the current channel is in automatic slow state (admin/mod only)."""
-    if not is_mod(ctx.author):
-        await ctx.send("You must be a moderator to use this command.")
-        return
-    ch = ctx.channel
-    state = channel_slowstate.get(ch.id)
-    if state:
-        original = state.get("original", 0)
-        await ctx.send(f"Channel is currently in auto-slow state. Original slowmode: {original}s.")
+    """Check if current channel is slowed automatically"""
+    if ctx.channel.id in slow_channels:
+        await ctx.send("⚠️ This channel is under automatic slowdown.")
     else:
-        await ctx.send("Channel is not currently in auto-slow state.")
+        await ctx.send("✅ This channel is not slowed.")
 
-@bot.command(name="force_slow")
+@bot.command()
 @commands.has_permissions(manage_channels=True)
-async def force_slow(ctx: commands.Context, slow_seconds: int = SLOW_MODE_DURATION, duration_seconds: int = SLOW_RESET_SECONDS):
-    """Force-enable slowmode in the current channel for a given period (admin-only)."""
-    ch = ctx.channel
-    original = ch.slowmode_delay or 0
-    try:
-        await ch.edit(slowmode_delay=slow_seconds, reason=f"Forced slow by {ctx.author}")
-        # cancel existing reset if present
-        if ch.id in channel_slowstate:
-            # cancel previous task
-            try:
-                prev_task = channel_slowstate[ch.id].get("reset_task")
-                if prev_task and not prev_task.done():
-                    prev_task.cancel()
-            except Exception:
-                pass
-        await schedule_slowmode_reset(ch, original, duration_seconds)
-        await ctx.send(f"Forced slowmode {slow_seconds}s for {duration_seconds}s (original: {original}s).")
-    except discord.Forbidden:
-        await ctx.send("Missing permission to edit channel slowmode.")
-    except Exception as e:
-        await ctx.send("Failed to set slowmode: " + str(e))
-
-# --------------------
-# Error handlers
-# --------------------
-@force_slow.error
-async def force_slow_error(ctx: commands.Context, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You need Manage Channels permission to use this command.")
-    else:
-        await ctx.send(f"Error: {error}")
+async def force_slow(ctx: commands.Context, seconds: int = SLOW_MODE_DURATION, duration: int = SLOW_RESET_SECONDS):
+    """Force slowmode in current channel"""
+    original = ctx.channel.slowmode_delay
+    await ctx.channel.edit(slowmode_delay=seconds, reason=f"Forced by {ctx.author}")
+    await ctx.send(f"⏳ Forced slowmode {seconds}s for {duration}s.")
+    bot.loop.create_task(reset_slowmode(ctx.channel, original, duration))
 
 # --------------------
 # Run
