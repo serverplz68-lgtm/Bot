@@ -1,0 +1,19 @@
+{
+  "name": "aashirwadgamerzz-v1-discord-bot",
+  "version": "1.0.0",
+  "description": "Production-minded Discord AI, moderation, anti-spam and anti-nuke bot.",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.0",
+    "dotenv": "^16.6.1",
+    "sqlite3": "^5.1.7"
+  }
+}
